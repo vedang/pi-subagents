@@ -1325,7 +1325,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 				...(config.progress !== undefined ? { progress: config.progress } : {}),
 			}));
 			const params: Record<string, unknown> = { chain, task: parsed.task, clarify: false, agentScope: "both" };
-			if (dir) params.dir = dir;
+			if (dir) params.chainDir = dir;
 			if (bg) params.async = true;
 			pi.sendUserMessage(`Call the subagent tool with these exact parameters: ${JSON.stringify(params)}`);
 		},
@@ -1350,7 +1350,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 				...(config.progress !== undefined ? { progress: config.progress } : {}),
 			}));
 			const params: Record<string, unknown> = { chain: [{ parallel: tasks }], task: parsed.task, clarify: false, agentScope: "both" };
-			if (dir) params.dir = dir;
+			if (dir) params.chainDir = dir;
 			if (bg) params.async = true;
 			pi.sendUserMessage(`Call the subagent tool with these exact parameters: ${JSON.stringify(params)}`);
 		},

@@ -245,6 +245,15 @@ describe("slash command parsing for --dir and quoted task text", {
 		assert.equal(extractDirField(payload), undefined);
 	});
 
+	it("/chain injects chainDir when --dir is provided", async () => {
+		await commandHandlers.chain.handler('scout "draft structure" -> planner "finalize" --dir .agents/plans/chain-dir', ctx);
+		const payload = parseToolCallPayload(messages);
+
+		assert.equal(payload.chainDir, path.resolve(process.cwd(), ".agents/plans/chain-dir"));
+		assert.equal(payload.dir, undefined);
+		assert.ok(expectedDirValue(extractDirField(payload), ".agents/plans/chain-dir"));
+	});
+
 	it("/parallel parses --dir and keeps quoted task text intact", async () => {
 		await commandHandlers.parallel.handler('scout "scan API surface" -> reviewer "spot --dir mentions" --dir .agents/plans/parallel-dir', ctx);
 		const payload = parseToolCallPayload(messages);
@@ -258,6 +267,8 @@ describe("slash command parsing for --dir and quoted task text", {
 		assert.equal(parallelStep[0]?.parallel[1]?.task, "spot --dir mentions");
 		assert.equal(payload.async, undefined);
 		assert.equal(payload.task, "scan API surface");
+		assert.equal(payload.dir, undefined);
+		assert.equal(payload.chainDir, path.resolve(process.cwd(), ".agents/plans/parallel-dir"));
 		assert.ok(expectedDirValue(extractDirField(payload), ".agents/plans/parallel-dir"));
 	});
 });
