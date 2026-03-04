@@ -1240,7 +1240,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 			if (inline.output !== undefined) params.output = inline.output;
 			if (inline.skill !== undefined) params.skill = inline.skill;
 			if (inline.model) params.model = inline.model;
-			if (dir) params.dir = dir;
+			if (dir) params.cwd = dir;
 			if (bg) params.async = true;
 			pi.sendUserMessage(`Call the subagent tool with these exact parameters: ${JSON.stringify({ ...params, agentScope: "both" })}`);
 		},

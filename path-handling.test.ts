@@ -139,17 +139,10 @@ const parseToolCallPayload = (messages: string[]): CommandPayload => {
 	return JSON.parse(rawPayload) as CommandPayload;
 };
 
-const extractDirField = (payload: CommandPayload): string | undefined => {
-	for (const key of ["dir", "chainDir", "sessionDir", "cwd"] as const) {
-		const value = payload[key];
-		if (typeof value === "string") return value;
-	}
-	return undefined;
-};
-
-const expectedDirValue = (value: string | undefined, expected: string): boolean => {
-	if (!value) return false;
-	return value === expected || value === path.resolve(process.cwd(), expected);
+const assertRunDirAliases = (payload: CommandPayload): void => {
+	assert.equal(payload.dir, undefined);
+	assert.equal(payload.chainDir, undefined);
+	assert.equal(payload.sessionDir, undefined);
 };
 
 
@@ -195,7 +188,8 @@ describe("slash command parsing for --dir and quoted task text", {
 		assert.equal(payload.clarify, false);
 		assert.equal(payload.async, undefined);
 		assert.equal(payload.agentScope, "both");
-		assert.ok(expectedDirValue(extractDirField(payload), ".agents/plans/dir-space"));
+		assert.equal(payload.cwd, path.resolve(process.cwd(), ".agents/plans/dir-space"));
+		assertRunDirAliases(payload);
 	});
 
 	it("/run parses --dir=<path> without disturbing task text", async () => {
@@ -205,7 +199,8 @@ describe("slash command parsing for --dir and quoted task text", {
 		assert.equal(payload.agent, "scout");
 		assert.equal(payload.task, "collect architecture notes");
 		assert.equal(payload.async, undefined);
-		assert.ok(expectedDirValue(extractDirField(payload), ".agents/plans/dir-eq"));
+		assert.equal(payload.cwd, path.resolve(process.cwd(), ".agents/plans/dir-eq"));
+		assertRunDirAliases(payload);
 	});
 
 	it("/run preserves legacy /bg behavior when --dir is absent", async () => {
@@ -216,7 +211,8 @@ describe("slash command parsing for --dir and quoted task text", {
 		assert.equal(payload.task, "legacy mode run");
 		assert.equal(payload.async, true);
 		assert.equal(payload.agentScope, "both");
-		assert.equal(extractDirField(payload), undefined);
+		assert.equal(payload.cwd, undefined);
+		assertRunDirAliases(payload);
 	});
 
 	it("/run preserves quoted task text that includes --dir while supporting --bg", async () => {
@@ -226,8 +222,8 @@ describe("slash command parsing for --dir and quoted task text", {
 		assert.equal(payload.agent, "scout");
 		assert.equal(payload.task, "mention --dir inside quote and keep --bg text");
 		assert.equal(payload.async, true);
-		assert.equal(payload.dir, undefined);
-		assert.equal(extractDirField(payload), undefined);
+		assert.equal(payload.cwd, undefined);
+		assertRunDirAliases(payload);
 	});
 
 	it("/run handles /run with both --bg and --dir while preserving quoted flag-like substrings", async () => {
@@ -238,8 +234,9 @@ describe("slash command parsing for --dir and quoted task text", {
 		assert.equal(payload.task, "mention --dir and --bg in quoted task");
 		assert.equal(payload.async, true);
 		assert.equal(payload.agentScope, "both");
+		assert.equal(payload.cwd, path.resolve(process.cwd(), ".agents/plans/run-dir-bg"));
 		assert.equal(payload.chainDir, undefined);
-		assert.ok(expectedDirValue(extractDirField(payload), ".agents/plans/run-dir-bg"));
+		assertRunDirAliases(payload);
 	});
 
 	it("/chain preserves quoted per-step task text when --bg is present", async () => {
@@ -256,7 +253,9 @@ describe("slash command parsing for --dir and quoted task text", {
 		assert.equal(payload.async, true);
 		assert.equal(payload.task, "inspect --dir token in quote");
 		assert.equal(payload.chainDir, undefined);
-		assert.equal(extractDirField(payload), undefined);
+		assert.equal(payload.cwd, undefined);
+		assert.equal(payload.dir, undefined);
+		assert.equal(payload.sessionDir, undefined);
 	});
 
 	it("/chain parses combined --bg + --dir and preserves quoted flag-like task text", async () => {
@@ -273,8 +272,9 @@ describe("slash command parsing for --dir and quoted task text", {
 		assert.equal(payload.async, true);
 		assert.equal(payload.task, "inspect --dir token in quote");
 		assert.equal(payload.chainDir, path.resolve(process.cwd(), ".agents/plans/chain-dir-bg"));
+		assert.equal(payload.cwd, undefined);
 		assert.equal(payload.dir, undefined);
-		assert.ok(expectedDirValue(extractDirField(payload), ".agents/plans/chain-dir-bg"));
+		assert.equal(payload.sessionDir, undefined);
 	});
 
 	it("/chain injects chainDir when --dir is provided", async () => {
@@ -282,9 +282,10 @@ describe("slash command parsing for --dir and quoted task text", {
 		const payload = parseToolCallPayload(messages);
 
 		assert.equal(payload.chainDir, path.resolve(process.cwd(), ".agents/plans/chain-dir"));
+		assert.equal(payload.cwd, undefined);
 		assert.equal(payload.dir, undefined);
+		assert.equal(payload.sessionDir, undefined);
 		assert.equal(payload.async, undefined);
-		assert.ok(expectedDirValue(extractDirField(payload), ".agents/plans/chain-dir"));
 	});
 
 	it("/parallel preserves legacy parse when --dir is absent", async () => {
@@ -300,9 +301,10 @@ describe("slash command parsing for --dir and quoted task text", {
 		assert.equal(parallelStep[0]?.parallel[1]?.task, "spot --bg text");
 		assert.equal(payload.async, undefined);
 		assert.equal(payload.task, "scan API surface");
+		assert.equal(payload.cwd, undefined);
 		assert.equal(payload.dir, undefined);
+		assert.equal(payload.sessionDir, undefined);
 		assert.equal(payload.chainDir, undefined);
-		assert.equal(extractDirField(payload), undefined);
 	});
 
 	it("/parallel parses --dir and keeps quoted task text intact", async () => {
@@ -318,9 +320,10 @@ describe("slash command parsing for --dir and quoted task text", {
 		assert.equal(parallelStep[0]?.parallel[1]?.task, "spot --dir mentions");
 		assert.equal(payload.async, undefined);
 		assert.equal(payload.task, "scan API surface");
+		assert.equal(payload.cwd, undefined);
 		assert.equal(payload.dir, undefined);
+		assert.equal(payload.sessionDir, undefined);
 		assert.equal(payload.chainDir, path.resolve(process.cwd(), ".agents/plans/parallel-dir"));
-		assert.ok(expectedDirValue(extractDirField(payload), ".agents/plans/parallel-dir"));
 	});
 
 	it("/parallel parses combined --bg + --dir while preserving quoted flag-like subtasks", async () => {
@@ -336,8 +339,9 @@ describe("slash command parsing for --dir and quoted task text", {
 		assert.equal(parallelStep[0]?.parallel[1]?.task, "summarize --bg token");
 		assert.equal(payload.async, true);
 		assert.equal(payload.task, "scan --dir token in quote");
-		assert.equal(payload.chainDir, path.resolve(process.cwd(), ".agents/plans/parallel-dir-bg"));
+		assert.equal(payload.cwd, undefined);
 		assert.equal(payload.dir, undefined);
-		assert.ok(expectedDirValue(extractDirField(payload), ".agents/plans/parallel-dir-bg"));
+		assert.equal(payload.sessionDir, undefined);
+		assert.equal(payload.chainDir, path.resolve(process.cwd(), ".agents/plans/parallel-dir-bg"));
 	});
 });
