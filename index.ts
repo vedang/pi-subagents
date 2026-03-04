@@ -305,7 +305,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 			// - Chains default to TUI (clarify: true), so async requires explicit clarify: false
 			// - Single defaults to no TUI, so async is allowed unless clarify: true is passed
 			const effectiveAsync = requestedAsync && !hasTasks && (
-				hasChain 
+				hasChain
 					? params.clarify === false    // chains: only async if TUI explicitly disabled
 					: params.clarify !== true     // single: async unless TUI explicitly enabled
 			);
@@ -525,7 +525,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 				let tasks = params.tasks.map(t => t.task);
 				const modelOverrides: (string | undefined)[] = params.tasks.map(t => (t as { model?: string }).model);
 				// Initialize skill overrides from task-level skill params (may be overridden by TUI)
-				const skillOverrides: (string[] | false | undefined)[] = params.tasks.map(t => 
+				const skillOverrides: (string[] | false | undefined)[] = params.tasks.map(t =>
 					normalizeSkillInput((t as { skill?: string | string[] | boolean }).skill)
 				);
 
@@ -539,7 +539,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 					}));
 
 					// Resolve behaviors with task-level skill overrides for TUI display
-					const behaviors = agentConfigs.map((c, i) => 
+					const behaviors = agentConfigs.map((c, i) =>
 						resolveStepBehavior(c, { skills: skillOverrides[i] })
 					);
 					const availableSkills = discoverAvailableSkills(ctx.cwd);
@@ -1043,6 +1043,17 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 		return { arg: input.slice(start, end), start };
 	};
 
+	const applyInlineConfigToStep = (
+		step: Record<string, unknown>,
+		config: InlineConfig,
+	): void => {
+		if (config.output !== undefined) step.output = config.output;
+		if (config.reads !== undefined) step.reads = config.reads;
+		if (config.model) step.model = config.model;
+		if (config.skill !== undefined) step.skill = config.skill;
+		if (config.progress !== undefined) step.progress = config.progress;
+	};
+
 	/** Extract trailing --bg and --dir flags from args, return cleaned args and parsed values */
 	const extractTrailingFlags = (args: string, commandCwd: string): { args: string; bg: boolean; dir?: string } => {
 		let working = args.trim();
@@ -1206,17 +1217,17 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 	});
 
 	pi.registerCommand("run", {
-		description: "Run a subagent directly: /run agent[output=file] task [--bg]",
+		description: "Run a subagent directly: /run agent[output=file] task [--bg] [--dir <path>]",
 		getArgumentCompletions: makeAgentCompletions(false),
 		handler: async (args, ctx) => {
 			const commandCwd = ctx.cwd ?? baseCwd;
 			const { args: cleanedArgs, bg, dir } = extractTrailingFlags(args, commandCwd);
 			const input = cleanedArgs.trim();
 			const firstSpace = input.indexOf(" ");
-			if (firstSpace === -1) { ctx.ui.notify("Usage: /run <agent> <task> [--bg]", "error"); return; }
+			if (firstSpace === -1) { ctx.ui.notify("Usage: /run <agent> <task> [--bg] [--dir <path>]", "error"); return; }
 			const { name: agentName, config: inline } = parseAgentToken(input.slice(0, firstSpace));
 			const task = input.slice(firstSpace + 1).trim();
-			if (!task) { ctx.ui.notify("Usage: /run <agent> <task> [--bg]", "error"); return; }
+			if (!task) { ctx.ui.notify("Usage: /run <agent> <task> [--bg] [--dir <path>]", "error"); return; }
 
 			const agents = discoverAgents(baseCwd, "both").agents;
 			if (!agents.find((a) => a.name === agentName)) { ctx.ui.notify(`Unknown agent: ${agentName}`, "error"); return; }
@@ -1236,6 +1247,27 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 	});
 
 	interface ParsedStep { name: string; config: InlineConfig; task?: string }
+
+	const buildChainStep = (step: ParsedStep, fallbackTask?: string): Record<string, unknown> => {
+		const chainStep: Record<string, unknown> = { agent: step.name };
+		if (step.task) {
+			chainStep.task = step.task;
+		} else if (fallbackTask) {
+			chainStep.task = fallbackTask;
+		}
+		applyInlineConfigToStep(chainStep, step.config);
+		return chainStep;
+	};
+
+	const buildParallelTask = (step: ParsedStep, fallbackTask?: string): Record<string, unknown> => {
+		const parallelTask: Record<string, unknown> = { agent: step.name };
+		const task = step.task ?? fallbackTask;
+		if (task !== undefined) {
+			parallelTask.task = task;
+		}
+		applyInlineConfigToStep(parallelTask, step.config);
+		return parallelTask;
+	};
 
 	const parseAgentArgs = (args: string, command: string, ctx: ExtensionContext): { steps: ParsedStep[]; task: string } | null => {
 		const input = args.trim();
@@ -1308,22 +1340,14 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 	};
 
 	pi.registerCommand("chain", {
-		description: "Run agents in sequence: /chain scout \"task\" -> planner [--bg]",
+		description: "Run agents in sequence: /chain scout \"task\" -> planner [--bg] [--dir <path>]",
 		getArgumentCompletions: makeAgentCompletions(true),
 		handler: async (args, ctx) => {
 			const commandCwd = ctx.cwd ?? baseCwd;
 			const { args: cleanedArgs, bg, dir } = extractTrailingFlags(args, commandCwd);
 			const parsed = parseAgentArgs(cleanedArgs, "chain", ctx);
 			if (!parsed) return;
-			const chain = parsed.steps.map(({ name, config, task: stepTask }, i) => ({
-				agent: name,
-				...(stepTask ? { task: stepTask } : i === 0 && parsed.task ? { task: parsed.task } : {}),
-				...(config.output !== undefined ? { output: config.output } : {}),
-				...(config.reads !== undefined ? { reads: config.reads } : {}),
-				...(config.model ? { model: config.model } : {}),
-				...(config.skill !== undefined ? { skill: config.skill } : {}),
-				...(config.progress !== undefined ? { progress: config.progress } : {}),
-			}));
+			const chain = parsed.steps.map((step, i) => buildChainStep(step, i === 0 ? parsed.task : undefined));
 			const params: Record<string, unknown> = { chain, task: parsed.task, clarify: false, agentScope: "both" };
 			if (dir) params.chainDir = dir;
 			if (bg) params.async = true;
@@ -1332,7 +1356,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 	});
 
 	pi.registerCommand("parallel", {
-		description: "Run agents in parallel: /parallel scout \"task1\" -> reviewer \"task2\" [--bg]",
+		description: "Run agents in parallel: /parallel scout \"task1\" -> reviewer \"task2\" [--bg] [--dir <path>]",
 		getArgumentCompletions: makeAgentCompletions(true),
 		handler: async (args, ctx) => {
 			const commandCwd = ctx.cwd ?? baseCwd;
@@ -1340,15 +1364,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 			const parsed = parseAgentArgs(cleanedArgs, "parallel", ctx);
 			if (!parsed) return;
 			if (parsed.steps.length > MAX_PARALLEL) { ctx.ui.notify(`Max ${MAX_PARALLEL} parallel tasks`, "error"); return; }
-			const tasks = parsed.steps.map(({ name, config, task: stepTask }) => ({
-				agent: name,
-				task: stepTask ?? parsed.task,
-				...(config.output !== undefined ? { output: config.output } : {}),
-				...(config.reads !== undefined ? { reads: config.reads } : {}),
-				...(config.model ? { model: config.model } : {}),
-				...(config.skill !== undefined ? { skill: config.skill } : {}),
-				...(config.progress !== undefined ? { progress: config.progress } : {}),
-			}));
+			const tasks = parsed.steps.map((step) => buildParallelTask(step, parsed.task));
 			const params: Record<string, unknown> = { chain: [{ parallel: tasks }], task: parsed.task, clarify: false, agentScope: "both" };
 			if (dir) params.chainDir = dir;
 			if (bg) params.async = true;
