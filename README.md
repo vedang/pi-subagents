@@ -538,7 +538,7 @@ Notes:
 | `artifacts` | boolean | true | Write debug artifacts |
 | `includeProgress` | boolean | false | Include full progress in result |
 | `share` | boolean | false | Upload session to GitHub Gist (see [Session Sharing](#session-sharing)) |
-| `sessionDir` | string | temp | Directory to store session logs |
+| `sessionDir` | string | unset | Optional directory to store session logs (overrides `defaultSessionDir`); when unset, fallback behavior applies |
 
 **ChainItem** can be either a sequential step or a parallel step:
 
@@ -604,11 +604,35 @@ Templates support three variables:
 
 This aggregated output becomes `{previous}` for the next step.
 
-## Chain Directory
+## Extension Configuration
 
+`pi-subagents` reads optional JSON config from `~/.pi/agent/extensions/subagent/config.json`.
+
+### `defaultSessionDir`
+
+`defaultSessionDir` sets the fallback directory used for session logs. Eg:
+
+```json
+{
+  "defaultSessionDir": "~/.pi/agent/sessions/subagent/"
+}
+```
+
+Session root resolution follows this precedence:
+1. `params.sessionDir` from the `subagent` tool call
+2. `config.defaultSessionDir`
+3. fallback behavior (no forced directory unless session tracking is explicitly enabled)
+
+When tracking is enabled but no directory is set (for example `share: true`), the extension falls back to a temporary directory under `<tmpdir>/pi-subagent-session-*/`.
+
+For compatibility, `--dir` omission on slash commands keeps existing defaults:
+- `/run`: existing session behavior when no explicit session override is provided.
+- `/chain`/`/parallel`: chain artifacts remain in `<tmpdir>/pi-chain-runs/{runId}/` unless `--dir` is used.
+
+## Chain Directory
 Each chain run creates `<tmpdir>/pi-chain-runs/{runId}/` containing:
 - `context.md` - Scout/context-builder output
-- `plan.md` - Planner output  
+- `plan.md` - Planner output
 - `progress.md` - Worker/reviewer shared progress
 - `parallel-{stepIndex}/` - Subdirectories for parallel step outputs
   - `0-{agent}/output.md` - First parallel task output
@@ -629,7 +653,14 @@ Files per task:
 
 ## Session Logs
 
-Session files (JSONL) are stored under a per-run session dir (temp by default). The session file path is shown in output. Set `sessionDir` to keep session logs outside `<tmpdir>`.
+Session files (JSONL) are stored under a per-run session dir when session logging is enabled. Directory selection follows the same precedence as above:
+1. explicit `sessionDir`
+2. `config.defaultSessionDir`
+3. temporary `<tmpdir>/pi-subagent-session-*/` fallback when `share: true`
+
+If none of those are set, no custom session dir is allocated (existing default behavior). The session file path is shown in output when available.
+
+Set `sessionDir` to force a specific path for one invocation.
 
 ## Session Sharing
 
