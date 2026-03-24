@@ -72,15 +72,13 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 		}
 	}
 
-	if (input.extensions !== undefined) {
-		args.push("--no-extensions");
-		for (const extPath of input.extensions) {
-			args.push("--extension", extPath);
-		}
-	} else {
-		for (const extPath of toolExtensionPaths) {
-			args.push("--extension", extPath);
-		}
+	// Subagents run in print/json mode, so they should not inherit the caller's
+	// ambient extension set. That keeps worker runs deterministic and avoids
+	// interactive/background extensions from keeping the child pi process alive
+	// after the assistant has already finished its turn.
+	args.push("--no-extensions");
+	for (const extPath of input.extensions ?? toolExtensionPaths) {
+		args.push("--extension", extPath);
 	}
 
 	if ((input.skills?.length ?? 0) > 0) {
