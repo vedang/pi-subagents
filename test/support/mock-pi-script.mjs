@@ -42,6 +42,7 @@ function defaultAssistantMessage(output) {
 			role: "assistant",
 			content: [{ type: "text", text: output }],
 			model: "mock/test-model",
+			stopReason: "stop",
 			usage: {
 				input: 100,
 				output: 50,
@@ -101,7 +102,11 @@ async function main() {
 
 	const jsonMode = isJsonMode(process.argv.slice(2));
 	const response = claimNextResponse(queueDir) ?? defaultResponse();
-	fs.writeFileSync(path.join(queueDir, `call-${Date.now()}-${process.pid}-${Math.random().toString(16).slice(2)}.json`), "", "utf-8");
+	fs.writeFileSync(
+		path.join(queueDir, `call-${Date.now()}-${process.pid}-${Math.random().toString(16).slice(2)}.json`),
+		JSON.stringify({ args: process.argv.slice(2) }),
+		"utf-8",
+	);
 
 	if (typeof response.delay === "number" && response.delay > 0) {
 		await new Promise((resolve) => setTimeout(resolve, response.delay));

@@ -40,6 +40,66 @@ export interface TokenUsage {
 	total: number;
 }
 
+export type ActivityState = "needs_attention";
+export type ControlEventType = "needs_attention";
+export type ControlNotificationChannel = "event" | "async" | "intercom";
+
+export interface ControlConfig {
+	enabled?: boolean;
+	needsAttentionAfterMs?: number;
+	notifyOn?: ControlEventType[];
+	notifyChannels?: ControlNotificationChannel[];
+}
+
+export interface ResolvedControlConfig {
+	enabled: boolean;
+	needsAttentionAfterMs: number;
+	notifyOn: ControlEventType[];
+	notifyChannels: ControlNotificationChannel[];
+}
+
+export interface ControlEvent {
+	type: ControlEventType;
+	from?: ActivityState;
+	to: ActivityState;
+	ts: number;
+	agent: string;
+	index?: number;
+	runId: string;
+	message: string;
+}
+
+export type SubagentResultStatus = "completed" | "failed" | "paused" | "detached";
+
+export interface SubagentResultIntercomChild {
+	agent: string;
+	status: SubagentResultStatus;
+	summary: string;
+	index?: number;
+	artifactPath?: string;
+	sessionPath?: string;
+	intercomTarget?: string;
+}
+
+export interface SubagentResultIntercomPayload {
+	to: string;
+	message: string;
+	requestId?: string;
+	runId: string;
+	mode: "single" | "parallel" | "chain";
+	status: SubagentResultStatus;
+	summary: string;
+	source: "foreground" | "async";
+	children: SubagentResultIntercomChild[];
+	asyncId?: string;
+	asyncDir?: string;
+	chainSteps?: number;
+	agent?: string;
+	index?: number;
+	artifactPath?: string;
+	sessionPath?: string;
+}
+
 // ============================================================================
 // Progress Tracking
 // ============================================================================
@@ -48,10 +108,13 @@ export interface AgentProgress {
 	index: number;
 	agent: string;
 	status: "pending" | "running" | "completed" | "failed" | "detached";
+	activityState?: ActivityState;
 	task: string;
 	skills?: string[];
+	lastActivityAt?: number;
 	currentTool?: string;
 	currentToolArgs?: string;
+	currentToolStartedAt?: number;
 	recentTools: Array<{ tool: string; args: string; endMs: number }>;
 	recentOutput: string[];
 	toolCount: number;
@@ -59,6 +122,11 @@ export interface AgentProgress {
 	durationMs: number;
 	error?: string;
 	failedTool?: string;
+}
+
+export interface ToolCallSummary {
+	text: string;
+	expandedText: string;
 }
 
 export interface ProgressSummary {
@@ -85,17 +153,20 @@ export interface SingleResult {
 	exitCode: number;
 	detached?: boolean;
 	detachedReason?: string;
+	interrupted?: boolean;
 	messages?: Message[];
 	usage: Usage;
 	model?: string;
 	attemptedModels?: string[];
 	modelAttempts?: ModelAttempt[];
+	controlEvents?: ControlEvent[];
 	error?: string;
 	sessionFile?: string;
 	skills?: string[];
 	skillsWarning?: string;
 	progress?: AgentProgress;
 	progressSummary?: ProgressSummary;
+	toolCalls?: ToolCallSummary[];
 	artifactPaths?: ArtifactPaths;
 	truncation?: TruncationResult;
 	finalOutput?: string;
@@ -107,6 +178,7 @@ export interface Details {
 	mode: "single" | "parallel" | "chain" | "management";
 	context?: "fresh" | "fork";
 	results: SingleResult[];
+	controlEvents?: ControlEvent[];
 	asyncId?: string;
 	asyncDir?: string;
 	progress?: AgentProgress[];
@@ -154,15 +226,26 @@ export interface ArtifactConfig {
 export interface AsyncStatus {
 	runId: string;
 	mode: "single" | "chain";
-	state: "queued" | "running" | "complete" | "failed";
+	state: "queued" | "running" | "complete" | "failed" | "paused";
+	activityState?: ActivityState;
+	lastActivityAt?: number;
+	currentTool?: string;
+	currentToolStartedAt?: number;
 	startedAt: number;
 	endedAt?: number;
 	lastUpdate?: number;
+	pid?: number;
 	cwd?: string;
 	currentStep?: number;
 	steps?: Array<{
 		agent: string;
 		status: string;
+		activityState?: ActivityState;
+		lastActivityAt?: number;
+		currentTool?: string;
+		currentToolStartedAt?: number;
+		startedAt?: number;
+		endedAt?: number;
 		durationMs?: number;
 		tokens?: TokenUsage;
 		skills?: string[];
@@ -180,7 +263,11 @@ export interface AsyncStatus {
 export interface AsyncJobState {
 	asyncId: string;
 	asyncDir: string;
-	status: "queued" | "running" | "complete" | "failed";
+	status: "queued" | "running" | "complete" | "failed" | "paused";
+	activityState?: ActivityState;
+	lastActivityAt?: number;
+	currentTool?: string;
+	currentToolStartedAt?: number;
 	mode?: "single" | "chain";
 	agents?: string[];
 	currentStep?: number;
@@ -191,12 +278,27 @@ export interface AsyncJobState {
 	outputFile?: string;
 	totalTokens?: TokenUsage;
 	sessionFile?: string;
+	controlEventCursor?: number;
 }
 
 export interface SubagentState {
 	baseCwd: string;
 	currentSessionId: string | null;
 	asyncJobs: Map<string, AsyncJobState>;
+	foregroundControls: Map<string, {
+		runId: string;
+		mode: "single" | "parallel" | "chain";
+		startedAt: number;
+		updatedAt: number;
+		currentAgent?: string;
+		currentIndex?: number;
+		currentActivityState?: ActivityState;
+		lastActivityAt?: number;
+		currentTool?: string;
+		currentToolStartedAt?: number;
+		interrupt?: () => boolean;
+	}>;
+	lastForegroundControlId: string | null;
 	cleanupTimers: Map<string, ReturnType<typeof setTimeout>>;
 	lastUiContext: ExtensionContext | null;
 	poller: NodeJS.Timeout | null;
@@ -235,6 +337,12 @@ export interface IntercomEventBus {
 
 export const INTERCOM_DETACH_REQUEST_EVENT = "pi-intercom:detach-request";
 export const INTERCOM_DETACH_RESPONSE_EVENT = "pi-intercom:detach-response";
+export const SUBAGENT_ASYNC_STARTED_EVENT = "subagent:async-started";
+export const SUBAGENT_ASYNC_COMPLETE_EVENT = "subagent:async-complete";
+export const SUBAGENT_CONTROL_EVENT = "subagent:control-event";
+export const SUBAGENT_CONTROL_INTERCOM_EVENT = "subagent:control-intercom";
+export const SUBAGENT_RESULT_INTERCOM_EVENT = "subagent:result-intercom";
+export const SUBAGENT_RESULT_INTERCOM_DELIVERY_EVENT = "subagent:result-intercom-delivery";
 
 // ============================================================================
 // Execution Options
@@ -243,9 +351,13 @@ export const INTERCOM_DETACH_RESPONSE_EVENT = "pi-intercom:detach-response";
 export interface RunSyncOptions {
 	cwd?: string;
 	signal?: AbortSignal;
+	interruptSignal?: AbortSignal;
 	allowIntercomDetach?: boolean;
 	intercomEvents?: IntercomEventBus;
 	onUpdate?: (r: import("@mariozechner/pi-agent-core").AgentToolResult<Details>) => void;
+	onControlEvent?: (event: ControlEvent) => void;
+	controlConfig?: ResolvedControlConfig;
+	intercomSessionName?: string;
 	maxOutput?: MaxOutputConfig;
 	artifactsDir?: string;
 	artifactConfig?: ArtifactConfig;
@@ -273,10 +385,18 @@ export interface IntercomBridgeConfig {
 	instructionFile?: string;
 }
 
+export interface TopLevelParallelConfig {
+	maxTasks?: number;
+	concurrency?: number;
+}
+
 export interface ExtensionConfig {
 	asyncByDefault?: boolean;
+	forceTopLevelAsync?: boolean;
 	defaultSessionDir?: string;
 	maxSubagentDepth?: number;
+	control?: ControlConfig;
+	parallel?: TopLevelParallelConfig;
 	worktreeSetupHook?: string;
 	worktreeSetupHookTimeoutMs?: number;
 	intercomBridge?: IntercomBridgeConfig;
@@ -372,9 +492,29 @@ export const MAX_WIDGET_JOBS = 4;
 export const DEFAULT_SUBAGENT_MAX_DEPTH = 2;
 
 export const DEFAULT_FORK_PREAMBLE =
-	"You are a delegated subagent with access to the parent session's context for reference. " +
-	"Your sole job is to execute the task below. Do not continue or respond to the prior conversation " +
-	"— focus exclusively on completing this task using your tools.";
+	"You are a delegated subagent running from a fork of the parent session. " +
+	"Treat the inherited conversation as reference-only context, not a live thread to continue. " +
+	"Do not continue or answer prior messages as if they are waiting for a reply. " +
+	"Your sole job is to execute the task below and return a focused result for that task using your tools.";
+
+function normalizeTopLevelParallelValue(value: unknown): number | undefined {
+	const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+	if (!Number.isInteger(parsed) || parsed < 1) return undefined;
+	return parsed;
+}
+
+export function resolveTopLevelParallelMaxTasks(value: unknown): number {
+	return normalizeTopLevelParallelValue(value) ?? MAX_PARALLEL;
+}
+
+export function resolveTopLevelParallelConcurrency(
+	override: unknown,
+	configValue: unknown,
+): number {
+	return normalizeTopLevelParallelValue(override)
+		?? normalizeTopLevelParallelValue(configValue)
+		?? MAX_CONCURRENCY;
+}
 
 export function getAsyncConfigPath(suffix: string): string {
 	return path.join(TEMP_ROOT_DIR, `async-cfg-${suffix}.json`);

@@ -12,17 +12,21 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import type { AgentConfig } from "./agents.ts";
 import { applyThinkingSuffix } from "./pi-args.ts";
 import { injectSingleOutputInstruction, resolveSingleOutputPath } from "./single-output.ts";
-import { isParallelStep, resolveStepBehavior, type ChainStep, type SequentialStep, type StepOverrides } from "./settings.ts";
+import { buildChainInstructions, isParallelStep, resolveStepBehavior, writeInitialProgressFile, type ChainStep, type ResolvedStepBehavior, type SequentialStep, type StepOverrides } from "./settings.ts";
 import type { RunnerStep } from "./parallel-utils.ts";
 import { resolvePiPackageRoot } from "./pi-spawn.ts";
 import { buildSkillInjection, normalizeSkillInput, resolveSkillsWithFallback } from "./skills.ts";
+import { resolveChildCwd } from "./utils.ts";
 import { buildModelCandidates, resolveModelCandidate, type AvailableModelInfo } from "./model-fallback.ts";
+import { resolveExpectedWorktreeAgentCwd } from "./worktree.ts";
 import {
 	type ArtifactConfig,
 	type Details,
 	type MaxOutputConfig,
+	type ResolvedControlConfig,
 	ASYNC_DIR,
 	RESULTS_DIR,
+	SUBAGENT_ASYNC_STARTED_EVENT,
 	TEMP_ROOT_DIR,
 	getAsyncConfigPath,
 	resolveChildMaxSubagentDepth,
@@ -60,6 +64,7 @@ export interface AsyncExecutionContext {
 
 export interface AsyncChainParams {
 	chain: ChainStep[];
+	resultMode?: "parallel" | "chain";
 	agents: AgentConfig[];
 	ctx: AsyncExecutionContext;
 	availableModels?: AvailableModelInfo[];
@@ -74,11 +79,14 @@ export interface AsyncChainParams {
 	maxSubagentDepth: number;
 	worktreeSetupHook?: string;
 	worktreeSetupHookTimeoutMs?: number;
+	controlConfig?: ResolvedControlConfig;
+	controlIntercomTarget?: string;
+	childIntercomTarget?: (agent: string, index: number) => string | undefined;
 }
 
 export interface AsyncSingleParams {
 	agent: string;
-	task: string;
+	task?: string;
 	agentConfig: AgentConfig;
 	ctx: AsyncExecutionContext;
 	cwd?: string;
@@ -95,6 +103,9 @@ export interface AsyncSingleParams {
 	maxSubagentDepth: number;
 	worktreeSetupHook?: string;
 	worktreeSetupHookTimeoutMs?: number;
+	controlConfig?: ResolvedControlConfig;
+	controlIntercomTarget?: string;
+	childIntercomTarget?: (agent: string, index: number) => string | undefined;
 }
 
 export interface AsyncExecutionResult {
@@ -113,22 +124,39 @@ export function isAsyncAvailable(): boolean {
 /**
  * Spawn the async runner process
  */
-function spawnRunner(cfg: object, suffix: string, cwd: string): number | undefined {
-	if (!jitiCliPath) return undefined;
-	
+function spawnRunner(cfg: object, suffix: string, cwd: string): { pid?: number; error?: string } {
+	if (!jitiCliPath) {
+		return { error: "jiti for TypeScript execution could not be found" };
+	}
+
+	try {
+		const cwdStats = fs.statSync(cwd);
+		if (!cwdStats.isDirectory()) {
+			return { error: `cwd is not a directory: ${cwd}` };
+		}
+	} catch {
+		return { error: `cwd does not exist: ${cwd}` };
+	}
+
 	fs.mkdirSync(TEMP_ROOT_DIR, { recursive: true });
 	const cfgPath = getAsyncConfigPath(suffix);
 	fs.writeFileSync(cfgPath, JSON.stringify(cfg));
 	const runner = path.join(path.dirname(fileURLToPath(import.meta.url)), "subagent-runner.ts");
-	
+
 	const proc = spawn(process.execPath, [jitiCliPath, runner, cfgPath], {
 		cwd,
 		detached: true,
 		stdio: "ignore",
 		windowsHide: true,
 	});
+	proc.on("error", (error) => {
+		console.error(`[pi-subagents] async spawn failed: ${error.message}`);
+	});
+	if (typeof proc.pid !== "number") {
+		return { error: `async runner did not produce a pid for cwd: ${cwd}` };
+	}
 	proc.unref();
-	return proc.pid;
+	return { pid: proc.pid };
 }
 
 function formatAsyncStartError(mode: "single" | "chain", message: string): AsyncExecutionResult {
@@ -160,9 +188,13 @@ export function executeAsyncChain(
 		maxSubagentDepth,
 		worktreeSetupHook,
 		worktreeSetupHookTimeoutMs,
+		controlConfig,
+		controlIntercomTarget,
+		childIntercomTarget,
 	} = params;
 	const chainSkills = params.chainSkills ?? [];
 	const availableModels = params.availableModels;
+	const runnerCwd = resolveChildCwd(ctx.cwd, cwd);
 
 	for (const s of chain) {
 		const stepAgents = isParallelStep(s)
@@ -191,37 +223,54 @@ export function executeAsyncChain(
 		};
 	}
 
-	const buildSeqStep = (s: SequentialStep, sessionFile?: string) => {
-		const a = agents.find((x) => x.name === s.agent)!;
+	let progressInstructionCreated = false;
+	const buildStepOverrides = (s: SequentialStep): StepOverrides => {
 		const stepSkillInput = normalizeSkillInput(s.skill);
-		const stepOverrides: StepOverrides = { skills: stepSkillInput };
-		const behavior = resolveStepBehavior(a, stepOverrides, chainSkills);
+		return {
+			...(s.output !== undefined ? { output: s.output } : {}),
+			...(s.reads !== undefined ? { reads: s.reads } : {}),
+			...(s.progress !== undefined ? { progress: s.progress } : {}),
+			...(stepSkillInput !== undefined ? { skills: stepSkillInput } : {}),
+			...(s.model ? { model: s.model } : {}),
+		};
+	};
+	const buildSeqStep = (s: SequentialStep, sessionFile?: string, behaviorCwd?: string, progressPrecreated = false, resolvedBehavior?: ResolvedStepBehavior) => {
+		const a = agents.find((x) => x.name === s.agent)!;
+		const stepCwd = resolveChildCwd(runnerCwd, s.cwd);
+		const instructionCwd = behaviorCwd ?? stepCwd;
+		const behavior = resolvedBehavior ?? resolveStepBehavior(a, buildStepOverrides(s), chainSkills);
 		const skillNames = behavior.skills === false ? [] : behavior.skills;
-		const skillCwd = s.cwd ?? cwd ?? ctx.cwd;
-		const { resolved: resolvedSkills } = resolveSkillsWithFallback(skillNames, skillCwd, ctx.cwd);
+		const { resolved: resolvedSkills } = resolveSkillsWithFallback(skillNames, stepCwd, ctx.cwd);
 
-		let systemPrompt = a.systemPrompt?.trim() || null;
+		let systemPrompt = a.systemPrompt?.trim() ?? "";
 		if (resolvedSkills.length > 0) {
 			const injection = buildSkillInjection(resolvedSkills);
 			systemPrompt = systemPrompt ? `${systemPrompt}\n\n${injection}` : injection;
 		}
 
-		const outputPath = resolveSingleOutputPath(s.output, ctx.cwd, s.cwd ?? cwd);
-		const task = injectSingleOutputInstruction(s.task ?? "{previous}", outputPath);
+		const readInstructions = buildChainInstructions({ ...behavior, output: false, progress: false }, instructionCwd, false);
+		const isFirstProgressAgent = behavior.progress && !progressPrecreated && !progressInstructionCreated;
+		if (behavior.progress) progressInstructionCreated = true;
+		const progressInstructions = buildChainInstructions({ ...behavior, output: false, reads: false }, runnerCwd, isFirstProgressAgent);
+		const outputPath = resolveSingleOutputPath(behavior.output, ctx.cwd, instructionCwd);
+		const task = injectSingleOutputInstruction(`${readInstructions.prefix}${s.task ?? "{previous}"}${progressInstructions.suffix}`, outputPath);
 
-		const primaryModel = resolveModelCandidate(s.model ?? a.model, availableModels, ctx.currentModelProvider);
+		const primaryModel = resolveModelCandidate(behavior.model ?? a.model, availableModels, ctx.currentModelProvider);
 		return {
 			agent: s.agent,
 			task,
-			cwd: s.cwd,
+			cwd: stepCwd,
 			model: applyThinkingSuffix(primaryModel, a.thinking),
-			modelCandidates: buildModelCandidates(s.model ?? a.model, a.fallbackModels, availableModels, ctx.currentModelProvider).map((candidate) =>
+			modelCandidates: buildModelCandidates(behavior.model ?? a.model, a.fallbackModels, availableModels, ctx.currentModelProvider).map((candidate) =>
 				applyThinkingSuffix(candidate, a.thinking),
 			),
 			tools: a.tools,
 			extensions: a.extensions,
 			mcpDirectTools: a.mcpDirectTools,
 			systemPrompt,
+			systemPromptMode: a.systemPromptMode,
+			inheritProjectContext: a.inheritProjectContext,
+			inheritSkills: a.inheritSkills,
 			skills: resolvedSkills.map((r) => r.name),
 			outputPath,
 			sessionFile,
@@ -236,17 +285,29 @@ export function executeAsyncChain(
 		return sessionFile;
 	};
 
-	const steps: RunnerStep[] = chain.map((s) => {
+	const steps: RunnerStep[] = chain.map((s, stepIndex) => {
 		if (isParallelStep(s)) {
+			const parallelBehaviors = s.parallel.map((task) => {
+				const agent = agents.find((candidate) => candidate.name === task.agent)!;
+				return resolveStepBehavior(agent, buildStepOverrides(task), chainSkills);
+			});
+			const progressPrecreated = parallelBehaviors.some((behavior) => behavior.progress);
+			if (progressPrecreated) {
+				if (!s.worktree) writeInitialProgressFile(runnerCwd);
+				progressInstructionCreated = true;
+			}
 			return {
-				parallel: s.parallel.map((t) => buildSeqStep({
-					agent: t.agent,
-					task: t.task,
-					cwd: t.cwd,
-					skill: t.skill,
-					model: t.model,
-					output: t.output,
-				}, nextSessionFile())),
+				parallel: s.parallel.map((t, taskIndex) => {
+					let behaviorCwd: string | undefined;
+					if (s.worktree) {
+						try {
+							behaviorCwd = resolveExpectedWorktreeAgentCwd(runnerCwd, `${id}-s${stepIndex}`, taskIndex);
+						} catch {
+							behaviorCwd = undefined;
+						}
+					}
+					return buildSeqStep(t, nextSessionFile(), behaviorCwd, progressPrecreated, parallelBehaviors[taskIndex]);
+				}),
 				concurrency: s.concurrency,
 				failFast: s.failFast,
 				worktree: s.worktree,
@@ -254,11 +315,17 @@ export function executeAsyncChain(
 		}
 		return buildSeqStep(s as SequentialStep, nextSessionFile());
 	});
+	let childTargetIndex = 0;
+	const childIntercomTargets = childIntercomTarget ? steps.flatMap((step) => {
+		if ("parallel" in step) {
+			return step.parallel.map((task) => childIntercomTarget(task.agent, childTargetIndex++));
+		}
+		return [childIntercomTarget(step.agent, childTargetIndex++)];
+	}) : undefined;
 
-	const runnerCwd = cwd ?? ctx.cwd;
-	let pid: number | undefined;
+	let spawnResult: { pid?: number; error?: string } = {};
 	try {
-		pid = spawnRunner(
+		spawnResult = spawnRunner(
 			{
 				id,
 				steps,
@@ -276,6 +343,10 @@ export function executeAsyncChain(
 				piArgv1: process.argv[1],
 				worktreeSetupHook,
 				worktreeSetupHookTimeoutMs,
+				controlConfig,
+				controlIntercomTarget,
+				childIntercomTargets,
+				resultMode: params.resultMode ?? "chain",
 			},
 			id,
 			runnerCwd,
@@ -285,14 +356,18 @@ export function executeAsyncChain(
 		return formatAsyncStartError("chain", `Failed to start async chain '${id}': ${message}`);
 	}
 
-	if (pid) {
+	if (spawnResult.error) {
+		return formatAsyncStartError("chain", `Failed to start async chain '${id}': ${spawnResult.error}`);
+	}
+
+	if (spawnResult.pid) {
 		const firstStep = chain[0];
 		const firstAgents = isParallelStep(firstStep)
 			? firstStep.parallel.map((t) => t.agent)
 			: [(firstStep as SequentialStep).agent];
-		ctx.pi.events.emit("subagent:started", {
+		ctx.pi.events.emit(SUBAGENT_ASYNC_STARTED_EVENT, {
 			id,
-			pid,
+			pid: spawnResult.pid,
 			agent: firstAgents[0],
 			task: isParallelStep(firstStep)
 				? firstStep.parallel[0]?.task?.slice(0, 50)
@@ -326,7 +401,6 @@ export function executeAsyncSingle(
 ): AsyncExecutionResult {
 	const {
 		agent,
-		task,
 		agentConfig,
 		ctx,
 		cwd,
@@ -339,12 +413,16 @@ export function executeAsyncSingle(
 		maxSubagentDepth,
 		worktreeSetupHook,
 		worktreeSetupHookTimeoutMs,
+		controlConfig,
+		controlIntercomTarget,
+		childIntercomTarget,
 	} = params;
+	const task = params.task ?? "";
+	const runnerCwd = resolveChildCwd(ctx.cwd, cwd);
 	const skillNames = params.skills ?? agentConfig.skills ?? [];
 	const availableModels = params.availableModels;
-	const skillCwd = cwd ?? ctx.cwd;
-	const { resolved: resolvedSkills } = resolveSkillsWithFallback(skillNames, skillCwd, ctx.cwd);
-	let systemPrompt = agentConfig.systemPrompt?.trim() || null;
+	const { resolved: resolvedSkills } = resolveSkillsWithFallback(skillNames, runnerCwd, ctx.cwd);
+	let systemPrompt = agentConfig.systemPrompt?.trim() ?? "";
 	if (resolvedSkills.length > 0) {
 		const injection = buildSkillInjection(resolvedSkills);
 		systemPrompt = systemPrompt ? `${systemPrompt}\n\n${injection}` : injection;
@@ -362,19 +440,18 @@ export function executeAsyncSingle(
 		};
 	}
 
-	const runnerCwd = cwd ?? ctx.cwd;
-	const outputPath = resolveSingleOutputPath(params.output, ctx.cwd, cwd);
+	const outputPath = resolveSingleOutputPath(params.output, ctx.cwd, runnerCwd);
 	const taskWithOutputInstruction = injectSingleOutputInstruction(task, outputPath);
-	let pid: number | undefined;
+	let spawnResult: { pid?: number; error?: string } = {};
 	try {
-		pid = spawnRunner(
+		spawnResult = spawnRunner(
 			{
 				id,
 				steps: [
 					{
 						agent,
 						task: taskWithOutputInstruction,
-						cwd,
+						cwd: runnerCwd,
 						model: applyThinkingSuffix(resolveModelCandidate(params.modelOverride ?? agentConfig.model, availableModels, ctx.currentModelProvider), agentConfig.thinking),
 						modelCandidates: buildModelCandidates(params.modelOverride ?? agentConfig.model, agentConfig.fallbackModels, availableModels, ctx.currentModelProvider).map((candidate) =>
 							applyThinkingSuffix(candidate, agentConfig.thinking),
@@ -383,6 +460,9 @@ export function executeAsyncSingle(
 						extensions: agentConfig.extensions,
 						mcpDirectTools: agentConfig.mcpDirectTools,
 						systemPrompt,
+						systemPromptMode: agentConfig.systemPromptMode,
+						inheritProjectContext: agentConfig.inheritProjectContext,
+						inheritSkills: agentConfig.inheritSkills,
 						skills: resolvedSkills.map((r) => r.name),
 						outputPath,
 						sessionFile,
@@ -403,6 +483,10 @@ export function executeAsyncSingle(
 				piArgv1: process.argv[1],
 				worktreeSetupHook,
 				worktreeSetupHookTimeoutMs,
+				controlConfig,
+				controlIntercomTarget,
+				childIntercomTargets: childIntercomTarget ? [childIntercomTarget(agent, 0)] : undefined,
+				resultMode: "single",
 			},
 			id,
 			runnerCwd,
@@ -412,10 +496,14 @@ export function executeAsyncSingle(
 		return formatAsyncStartError("single", `Failed to start async run '${id}': ${message}`);
 	}
 
-	if (pid) {
-		ctx.pi.events.emit("subagent:started", {
+	if (spawnResult.error) {
+		return formatAsyncStartError("single", `Failed to start async run '${id}': ${spawnResult.error}`);
+	}
+
+	if (spawnResult.pid) {
+		ctx.pi.events.emit(SUBAGENT_ASYNC_STARTED_EVENT, {
 			id,
-			pid,
+			pid: spawnResult.pid,
 			agent,
 			task: task?.slice(0, 50),
 			cwd: runnerCwd,

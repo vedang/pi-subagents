@@ -27,7 +27,7 @@ function renderFieldLine(
 	width: number,
 	theme: Theme,
 ): string {
-	const labelWidth = 10;
+	const labelWidth = 12;
 	const labelText = theme.fg("dim", pad(label, labelWidth));
 	const available = Math.max(0, width - labelWidth);
 	return `${labelText}${truncateToWidth(value, available)}`;
@@ -61,6 +61,12 @@ function buildDetailLines(
 	const maxSubagentDepth = agent.maxSubagentDepth !== undefined ? String(agent.maxSubagentDepth) : "(default)";
 
 	lines.push(renderFieldLine("Model:", agent.model ?? "default", contentWidth, theme));
+	lines.push(renderFieldLine("Prompt mode:", agent.systemPromptMode, contentWidth, theme));
+	lines.push(renderFieldLine("Project ctx:", agent.inheritProjectContext ? "on" : "off", contentWidth, theme));
+	lines.push(renderFieldLine("Skills ctx:", agent.inheritSkills ? "on" : "off", contentWidth, theme));
+	if (agent.source === "builtin") {
+		lines.push(renderFieldLine("Disabled:", agent.disabled ? "on" : "off", contentWidth, theme));
+	}
 	if (agent.override) {
 		const overrideLabel = `${agent.override.scope} · ${formatPath(agent.override.path)}`;
 		lines.push(renderFieldLine("Override:", overrideLabel, contentWidth, theme));
@@ -136,7 +142,9 @@ export function renderDetail(
 ): string[] {
 	const lines: string[] = [];
 	const scopeBadge = agent.source === "builtin"
-		? (agent.override ? `[builtin+${agent.override.scope}]` : "[builtin]")
+		? (agent.disabled
+			? (agent.override ? `[builtin off+${agent.override.scope}]` : "[builtin off]")
+			: (agent.override ? `[builtin+${agent.override.scope}]` : "[builtin]"))
 		: agent.source === "project"
 			? "[proj]"
 			: "[user]";
@@ -161,11 +169,21 @@ export function renderDetail(
 
 	const footer = agent.source === "builtin"
 		? agent.override
-			? " [l]aunch  [e]dit override  [v] raw/resolved  [↑↓] scroll  [esc] back "
-			: " [l]aunch  [e]create override  [v] raw/resolved  [↑↓] scroll  [esc] back "
+			? (agent.disabled
+				? " [e]dit override  [v] raw/resolved  [↑↓] scroll  [esc] back "
+				: " [l]aunch  [e]dit override  [v] raw/resolved  [↑↓] scroll  [esc] back ")
+			: (agent.disabled
+				? " [e]create override  [v] raw/resolved  [↑↓] scroll  [esc] back "
+				: " [l]aunch  [e]create override  [v] raw/resolved  [↑↓] scroll  [esc] back ")
 		: " [l]aunch  [e]dit  [v] raw/resolved  [↑↓] scroll  [esc] back ";
 	lines.push(renderFooter(footer, width, theme));
 	return lines;
+}
+
+export interface LaunchToggleState {
+	fork: boolean;
+	background: boolean;
+	worktree?: boolean;
 }
 
 export function renderTaskInput(
@@ -174,6 +192,7 @@ export function renderTaskInput(
 	skipClarify: boolean,
 	width: number,
 	theme: Theme,
+	launchToggles?: LaunchToggleState,
 ): string[] {
 	const lines: string[] = [];
 	lines.push(renderHeader(` ${title} `, width, theme));
@@ -197,8 +216,14 @@ export function renderTaskInput(
 	lines.push(row(` ${bottom}`, width, theme));
 
 	lines.push(row("", width, theme));
-	const enterLabel = skipClarify ? "quick run" : "run";
 	const quickLabel = skipClarify ? "on" : "off";
-	lines.push(renderFooter(` [enter] ${enterLabel}  [tab] quick: ${quickLabel}  [esc] cancel `, width, theme));
+	const footerParts = ["[enter] run", `[tab] quick:${quickLabel}`];
+	if (launchToggles) {
+		footerParts.push(`[ctrl+f] fork:${launchToggles.fork ? "on" : "off"}`);
+		footerParts.push(`[ctrl+b] bg:${launchToggles.background ? "on" : "off"}`);
+		if (launchToggles.worktree !== undefined) footerParts.push(`[ctrl+w] worktree:${launchToggles.worktree ? "on" : "off"}`);
+	}
+	footerParts.push("[esc]");
+	lines.push(renderFooter(` ${footerParts.join("  ")} `, width, theme));
 	return lines;
 }

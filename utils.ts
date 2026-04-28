@@ -6,7 +6,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Message } from "@mariozechner/pi-ai";
-import type { AgentProgress, AsyncStatus, Details, DisplayItem, ErrorInfo, SingleResult } from "./types.ts";
+import { formatToolCall } from "./formatters.ts";
+import type { AgentProgress, AsyncStatus, Details, DisplayItem, ErrorInfo, SingleResult, ToolCallSummary } from "./types.ts";
 
 // ============================================================================
 // File System Utilities
@@ -16,6 +17,11 @@ const statusCache = new Map<string, { mtime: number; status: AsyncStatus }>();
 
 function getErrorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+export function resolveChildCwd(baseCwd: string, childCwd: string | undefined): string {
+	if (!childCwd) return baseCwd;
+	return path.isAbsolute(childCwd) ? childCwd : path.resolve(baseCwd, childCwd);
 }
 
 function isNotFoundError(error: unknown): boolean {
@@ -225,6 +231,7 @@ function compactCompletedProgress(progress: AgentProgress): AgentProgress {
 		index: progress.index,
 		agent: progress.agent,
 		status: progress.status,
+		activityState: progress.activityState,
 		task: progress.task,
 		skills: progress.skills,
 		toolCount: progress.toolCount,
@@ -237,12 +244,33 @@ function compactCompletedProgress(progress: AgentProgress): AgentProgress {
 	};
 }
 
+export function extractToolCallSummaries(messages: Message[] | undefined): ToolCallSummary[] {
+	if (!messages?.length) return [];
+	const summaries: ToolCallSummary[] = [];
+	for (const msg of messages) {
+		if (msg.role !== "assistant") continue;
+		for (const part of msg.content) {
+			if (part.type !== "toolCall") continue;
+			const args = typeof part.arguments === "object" && part.arguments !== null && !Array.isArray(part.arguments)
+				? part.arguments
+				: {};
+			summaries.push({
+				text: formatToolCall(part.name, args),
+				expandedText: formatToolCall(part.name, args, true),
+			});
+		}
+	}
+	return summaries;
+}
+
 export function compactForegroundResult(result: SingleResult): SingleResult {
 	if (result.progress?.status === "running") return result;
+	const toolCalls = result.toolCalls?.length ? result.toolCalls : extractToolCallSummaries(result.messages);
 	return {
 		...result,
 		messages: undefined,
 		progress: undefined,
+		toolCalls: toolCalls.length ? toolCalls : undefined,
 	};
 }
 
@@ -335,25 +363,54 @@ export function detectSubagentError(messages: Message[]): ErrorInfo {
  * Extract a preview of tool arguments for display
  */
 export function extractToolArgsPreview(args: Record<string, unknown>): string {
+	const truncatePreview = (value: string, maxLength: number): string =>
+		value.length > maxLength ? `${value.slice(0, maxLength - 3)}...` : value;
+
+	const stringifyPreviewValue = (value: unknown): string | undefined => {
+		if (typeof value === "string" && value.trim().length > 0) return value;
+		if (typeof value === "number" || typeof value === "boolean") return String(value);
+		return undefined;
+	};
+
+	const previewArray = (value: unknown): string | undefined => {
+		if (!Array.isArray(value) || value.length === 0) return undefined;
+		const first = stringifyPreviewValue(value[0]);
+		if (!first) return undefined;
+		const suffix = value.length > 1 ? ` (+${value.length - 1} more)` : "";
+		return `${first}${suffix}`;
+	};
+
 	// Handle MCP tool calls - show server/tool info
 	if (args.tool && typeof args.tool === "string") {
 		const server = args.server && typeof args.server === "string" ? `${args.server}/` : "";
 		const toolArgs = args.args && typeof args.args === "string" ? ` ${args.args.slice(0, 40)}` : "";
 		return `${server}${args.tool}${toolArgs}`;
 	}
+
+	const queriesPreview = previewArray(args.queries);
+	if (queriesPreview) return truncatePreview(queriesPreview, 60);
+	if (typeof args.query === "string" && args.query.trim().length > 0) return truncatePreview(args.query, 60);
+	if (typeof args.workflow === "string" && args.workflow.trim().length > 0) return `workflow=${truncatePreview(args.workflow, 48)}`;
+
+	if (typeof args.url === "string" && args.url.trim().length > 0) return truncatePreview(args.url, 60);
+	const urlsPreview = previewArray(args.urls);
+	if (urlsPreview) return truncatePreview(urlsPreview, 60);
+	if (typeof args.prompt === "string" && args.prompt.trim().length > 0) return truncatePreview(args.prompt, 60);
 	
 	const previewKeys = ["command", "path", "file_path", "pattern", "query", "url", "task", "describe", "search"];
 	for (const key of previewKeys) {
 		if (args[key] && typeof args[key] === "string") {
 			const value = args[key] as string;
-			return value.length > 60 ? `${value.slice(0, 57)}...` : value;
+			return truncatePreview(value, 60);
 		}
 	}
 	
 	// Fallback: show first string value found
 	for (const [key, value] of Object.entries(args)) {
+		const arrayPreview = previewArray(value);
+		if (arrayPreview) return `${key}=${truncatePreview(arrayPreview, 50)}`;
 		if (typeof value === "string" && value.length > 0) {
-			const preview = value.length > 50 ? `${value.slice(0, 47)}...` : value;
+			const preview = truncatePreview(value, 50);
 			return `${key}=${preview}`;
 		}
 	}
@@ -394,4 +451,4 @@ export function extractTextFromContent(content: unknown): string {
 // Concurrency Utilities
 // ============================================================================
 
-export { mapConcurrent } from "./parallel-utils.js";
+export { mapConcurrent } from "./parallel-utils.ts";

@@ -1,7 +1,7 @@
 /**
  * Integration tests for single (sync) agent execution.
  *
- * Uses createMockPi() from @marcfargas/pi-test-harness to simulate the pi CLI.
+ * Uses the local createMockPi() helper to simulate the pi CLI.
  * Tests the full spawn→parse→result pipeline in runSync without a real LLM.
  *
  * These tests require pi packages to be importable (they run inside a pi
@@ -17,12 +17,14 @@ import type { MockPi } from "../support/helpers.ts";
 import {
 	createMockPi,
 	createTempDir,
+	createEventBus,
 	removeTempDir,
 	makeAgentConfigs,
 	makeAgent,
 	events,
 	tryImport,
 } from "../support/helpers.ts";
+import { INTERCOM_DETACH_REQUEST_EVENT, INTERCOM_DETACH_RESPONSE_EVENT } from "../../types.ts";
 
 interface ModelAttempt {
 	success?: boolean;
@@ -32,6 +34,11 @@ interface ProgressSummary {
 	agent: string;
 	index: number;
 	status: string;
+	activityState?: string;
+	lastActivityAt?: number;
+	currentTool?: string;
+	currentToolArgs?: string;
+	currentToolStartedAt?: number;
 	durationMs: number;
 	toolCount: number;
 }
@@ -54,10 +61,12 @@ interface RunSyncResult {
 	progress: ProgressSummary;
 	artifactPaths?: ArtifactPaths;
 	finalOutput?: string;
+	interrupted?: boolean;
 	detached?: boolean;
 	detachedReason?: string;
 	savedOutputPath?: string;
 	outputSaveError?: string;
+	sessionFile?: string;
 }
 
 interface ExecutionModule {
@@ -74,40 +83,12 @@ interface UtilsModule {
 	getFinalOutput(messages: unknown[]): string;
 }
 
-interface TypesModule {
-	INTERCOM_DETACH_REQUEST_EVENT: string;
-	INTERCOM_DETACH_RESPONSE_EVENT: string;
-}
-
 const execution = await tryImport<ExecutionModule>("./execution.ts");
 const utils = await tryImport<UtilsModule>("./utils.ts");
-const types = await tryImport<TypesModule>("./types.ts");
 const available = !!(execution && utils);
 
 const runSync = execution?.runSync;
 const getFinalOutput = utils?.getFinalOutput;
-const INTERCOM_DETACH_REQUEST_EVENT = types?.INTERCOM_DETACH_REQUEST_EVENT ?? "pi-intercom:detach-request";
-const INTERCOM_DETACH_RESPONSE_EVENT = types?.INTERCOM_DETACH_RESPONSE_EVENT ?? "pi-intercom:detach-response";
-
-function createEventBus() {
-	const listeners = new Map<string, Set<(payload: unknown) => void>>();
-	return {
-		on(channel: string, handler: (payload: unknown) => void) {
-			const channelListeners = listeners.get(channel) ?? new Set();
-			channelListeners.add(handler);
-			listeners.set(channel, channelListeners);
-			return () => {
-				channelListeners.delete(handler);
-				if (channelListeners.size === 0) listeners.delete(channel);
-			};
-		},
-		emit(channel: string, payload: unknown) {
-			for (const handler of listeners.get(channel) ?? []) {
-				handler(payload);
-			}
-		},
-	};
-}
 
 function writePackageSkill(packageRoot: string, skillName: string): void {
 	const skillDir = path.join(packageRoot, "skills", skillName);
@@ -146,14 +127,27 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		removeTempDir(tempDir);
 	});
 
+	function readCallArgs(): string[] {
+		const callFile = fs.readdirSync(mockPi.dir)
+			.filter((name) => name.startsWith("call-") && name.endsWith(".json"))
+			.sort()
+			.at(-1);
+		assert.ok(callFile, "expected a recorded mock pi call");
+		const payload = JSON.parse(fs.readFileSync(path.join(mockPi.dir, callFile), "utf-8")) as { args?: string[] };
+		assert.ok(Array.isArray(payload.args), "expected recorded args");
+		return payload.args;
+	}
+
 	it("spawns agent and captures output", async () => {
 		mockPi.onCall({ output: "Hello from mock agent" });
 		const agents = makeAgentConfigs(["echo"]);
 
-		const result = await runSync(tempDir, agents, "echo", "Say hello", {});
+		const sessionFile = path.join(tempDir, "child-session.jsonl");
+		const result = await runSync(tempDir, agents, "echo", "Say hello", { sessionFile });
 
 		assert.equal(result.exitCode, 0);
 		assert.equal(result.agent, "echo");
+		assert.equal(result.sessionFile, sessionFile);
 		assert.ok(result.messages.length > 0, "should have messages");
 
 		const output = getFinalOutput(result.messages);
@@ -309,6 +303,40 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.ok(result.progress.durationMs > 0, "should track duration");
 	});
 
+	it("tracks live activity updates and exposes artifact paths while running", async () => {
+		const updates: Array<{ details?: { results?: Array<{ artifactPaths?: ArtifactPaths }>; progress?: ProgressSummary[] } }> = [];
+		mockPi.onCall({
+			steps: [
+				{ jsonl: [events.toolStart("read", { path: "package.json" })], delay: 20 },
+				{ jsonl: [events.toolEnd("read"), events.toolResult("read", "{\"name\":\"pkg\"}")], delay: 20 },
+				{ jsonl: [events.assistantMessage("Done")] },
+			],
+		});
+		const agents = makeAgentConfigs(["echo"]);
+		const artifactsDir = path.join(tempDir, "artifacts");
+
+		const result = await runSync(tempDir, agents, "echo", "Task", {
+			runId: "live-progress",
+			artifactsDir,
+			artifactConfig: { enabled: true, includeInput: true, includeOutput: true, includeMetadata: true },
+			onUpdate: (update: { details?: { results?: Array<{ artifactPaths?: ArtifactPaths }>; progress?: ProgressSummary[] } }) => {
+				updates.push(update);
+			},
+		});
+
+		assert.ok(updates.length > 0, "expected at least one live progress update");
+		assert.equal(
+			updates.some((update) => update.details?.results?.[0]?.artifactPaths?.outputPath.endsWith("_output.md") === true),
+			true,
+		);
+		const runningToolUpdate = updates.find((update) => update.details?.progress?.[0]?.currentTool === "read");
+		assert.ok(runningToolUpdate, "expected a live progress update for the running tool");
+		assert.equal(runningToolUpdate?.details?.progress?.[0]?.currentTool, "read");
+		assert.equal(typeof runningToolUpdate?.details?.progress?.[0]?.currentToolStartedAt, "number");
+		assert.equal(typeof result.progress.lastActivityAt, "number");
+		assert.equal(result.progress.currentToolStartedAt, undefined);
+	});
+
 	it("sets progress.status to failed on non-zero exit", async () => {
 		mockPi.onCall({ exitCode: 1 });
 		const agents = makeAgentConfigs(["fail"]);
@@ -441,6 +469,44 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		});
 	});
 
+	it("passes prompt inheritance env flags through to child execution", async () => {
+		mockPi.onCall({ echoEnv: ["PI_SUBAGENT_INHERIT_PROJECT_CONTEXT", "PI_SUBAGENT_INHERIT_SKILLS"] });
+		const agents = [makeAgent("echo", {
+			systemPromptMode: "replace",
+			inheritProjectContext: false,
+			inheritSkills: false,
+		})];
+
+		const result = await runSync(tempDir, agents, "echo", "Task", {
+			runId: "prompt-inheritance-env",
+		});
+
+		assert.equal(result.exitCode, 0);
+		assert.deepEqual(JSON.parse(result.finalOutput ?? "{}"), {
+			PI_SUBAGENT_INHERIT_PROJECT_CONTEXT: "0",
+			PI_SUBAGENT_INHERIT_SKILLS: "0",
+		});
+	});
+
+	it("passes custom tool extensions through even when explicit extensions are allowlisted", async () => {
+		mockPi.onCall({ output: "Done" });
+		const agents = [makeAgent("echo", {
+			tools: ["read", "./custom-tool.ts"],
+			extensions: ["./allowed-ext.ts"],
+		})];
+
+		const result = await runSync(tempDir, agents, "echo", "Task", {
+			runId: "tool-extension-allowlist",
+		});
+
+		assert.equal(result.exitCode, 0);
+		const args = readCallArgs();
+		const extensionArgs = args.filter((arg, index) => args[index - 1] === "--extension");
+		assert.ok(extensionArgs.some((arg) => arg.endsWith("subagent-prompt-runtime.ts")));
+		assert.ok(extensionArgs.includes("./custom-tool.ts"));
+		assert.ok(extensionArgs.includes("./allowed-ext.ts"));
+	});
+
 	it("handles abort signal (completes faster than delay)", async () => {
 		mockPi.onCall({ delay: 10000 }); // Long delay — process should be killed before this
 		const agents = makeAgentConfigs(["slow"]);
@@ -460,6 +526,32 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		// Exit code is platform-dependent (Windows: often 1 or 0, Linux: null/143)
 	});
 
+	it("soft-interrupts the current turn and returns a paused result", async () => {
+		mockPi.onCall({ delay: 10000 });
+		const agents = makeAgentConfigs(["slow"]);
+		const controller = new AbortController();
+		const controlEvents: Array<{ type?: string; to?: string }> = [];
+
+		const start = Date.now();
+		setTimeout(() => controller.abort(), 200);
+
+		const result = await runSync(tempDir, agents, "slow", "Slow task", {
+			runId: "interrupt-run",
+			interruptSignal: controller.signal,
+			onControlEvent: (event: { type?: string; to?: string }) => {
+				controlEvents.push(event);
+			},
+		});
+		const elapsed = Date.now() - start;
+
+		assert.ok(elapsed < 5000, `should interrupt early, took ${elapsed}ms`);
+		assert.equal(result.exitCode, 0);
+		assert.equal(result.interrupted, true);
+		assert.equal(result.progress.activityState, undefined);
+		assert.deepEqual(controlEvents, []);
+		assert.match(result.finalOutput ?? "", /Interrupted/);
+	});
+
 	it("detaches cleanly on intercom handoff without aborting the child process", async () => {
 		const eventBus = createEventBus();
 		let accepted = false;
@@ -475,15 +567,24 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		});
 		const agents = makeAgentConfigs(["echo"]);
 
+		// Emit the detach request the moment we observe the intercom tool start
+		// in a progress update — this is the signal the parent has set
+		// `intercomStarted=true`. Using a fixed delay here races the mock's
+		// cold spawn and flakes under load.
+		let detachEmitted = false;
 		const runPromise = runSync(tempDir, agents, "echo", "Task", {
 			runId: "intercom-detach",
 			allowIntercomDetach: true,
 			intercomEvents: eventBus,
+			onUpdate: (update) => {
+				if (detachEmitted) return;
+				const progress = (update as { details?: { progress?: Array<{ currentTool?: string }> } }).details?.progress;
+				const sawIntercom = Array.isArray(progress) && progress.some((p) => p?.currentTool === "intercom");
+				if (!sawIntercom) return;
+				detachEmitted = true;
+				eventBus.emit(INTERCOM_DETACH_REQUEST_EVENT, { requestId: "test-request" });
+			},
 		});
-
-		setTimeout(() => {
-			eventBus.emit(INTERCOM_DETACH_REQUEST_EVENT, { requestId: "test-request" });
-		}, 100);
 
 		const result = await runPromise;
 
@@ -495,6 +596,57 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(accepted, true);
 	});
 
+	it("lets an active intercom child accept detach when another child is listening", async () => {
+		const eventBus = createEventBus();
+		let firstDetachResponse: boolean | undefined;
+		eventBus.on(INTERCOM_DETACH_RESPONSE_EVENT, (payload) => {
+			if (!payload || typeof payload !== "object") return;
+			if ((payload as { requestId?: unknown }).requestId !== "parallel-request") return;
+			firstDetachResponse ??= (payload as { accepted?: unknown }).accepted === true;
+		});
+		mockPi.onCall({ delay: 500, output: "quiet child done" });
+		const agents = makeAgentConfigs(["quiet", "intercom"]);
+
+		const quietRun = runSync(tempDir, agents, "quiet", "Quiet task", {
+			runId: "quiet-listener",
+			allowIntercomDetach: true,
+			intercomEvents: eventBus,
+		});
+		for (let attempt = 0; attempt < 50 && mockPi.callCount() < 1; attempt++) {
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
+		assert.equal(mockPi.callCount(), 1);
+		mockPi.onCall({
+			steps: [
+				{ jsonl: [events.toolStart("intercom", { action: "send", to: "orchestrator" })] },
+				{ delay: 500, jsonl: [events.assistantMessage("after intercom")] },
+			],
+		});
+
+		let detachEmitted = false;
+		const intercomRun = runSync(tempDir, agents, "intercom", "Intercom task", {
+			runId: "active-intercom",
+			allowIntercomDetach: true,
+			intercomEvents: eventBus,
+			onUpdate: (update) => {
+				if (detachEmitted) return;
+				const progress = (update as { details?: { progress?: Array<{ currentTool?: string }> } }).details?.progress;
+				const sawIntercom = Array.isArray(progress) && progress.some((p) => p?.currentTool === "intercom");
+				if (!sawIntercom) return;
+				detachEmitted = true;
+				eventBus.emit(INTERCOM_DETACH_REQUEST_EVENT, { requestId: "parallel-request" });
+			},
+		});
+
+		const [quietResult, intercomResult] = await Promise.all([quietRun, intercomRun]);
+
+		assert.equal(quietResult.exitCode, 0);
+		assert.equal(quietResult.detached, undefined);
+		assert.equal(intercomResult.exitCode, 0);
+		assert.equal(intercomResult.detached, true);
+		assert.equal(firstDetachResponse, true);
+	});
+
 	it("handles stderr without exit code as info (not error)", async () => {
 		mockPi.onCall({ output: "Success", stderr: "Warning: something", exitCode: 0 });
 		const agents = makeAgentConfigs(["echo"]);
@@ -503,4 +655,5 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 
 		assert.equal(result.exitCode, 0);
 	});
+
 });

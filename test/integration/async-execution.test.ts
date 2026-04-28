@@ -9,9 +9,11 @@
 
 import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
-import { createMockPi, createTempDir, events, makeAgent, removeTempDir, tryImport } from "../support/helpers.ts";
+import { createEventBus, createMockPi, createTempDir, events, makeAgent, makeMinimalCtx, removeTempDir, tryImport } from "../support/helpers.ts";
 import type { MockPi } from "../support/helpers.ts";
 
 interface AsyncExecutionResult {
@@ -22,6 +24,7 @@ interface AsyncExecutionResult {
 
 interface AsyncResultPayload {
 	success: boolean;
+	mode?: string;
 	results: Array<unknown>;
 }
 
@@ -47,9 +50,16 @@ interface TypesModule {
 	TEMP_ROOT_DIR: string;
 }
 
+interface ExecutorModule {
+	createSubagentExecutor?: (...args: unknown[]) => {
+		execute: (...args: unknown[]) => Promise<{ content: Array<{ text?: string }>; isError?: boolean; details?: { asyncId?: string } }>;
+	};
+}
+
 const asyncMod = await tryImport<AsyncExecutionModule>("./async-execution.ts");
 const utils = await tryImport<UtilsModule>("./utils.ts");
 const typesMod = await tryImport<TypesModule>("./types.ts");
+const executorMod = await tryImport<ExecutorModule>("./subagent-executor.ts");
 const available = !!(asyncMod && utils && typesMod);
 
 const isAsyncAvailable = asyncMod?.isAsyncAvailable;
@@ -59,6 +69,26 @@ const readStatus = utils?.readStatus;
 const ASYNC_DIR = typesMod?.ASYNC_DIR;
 const RESULTS_DIR = typesMod?.RESULTS_DIR;
 const TEMP_ROOT_DIR = typesMod?.TEMP_ROOT_DIR;
+const createSubagentExecutor = executorMod?.createSubagentExecutor;
+
+function git(cwd: string, args: string[]): string {
+	const result = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf-8" });
+	if (result.status !== 0) {
+		throw new Error(result.stderr.trim() || result.stdout.trim() || `git ${args.join(" ")} failed`);
+	}
+	return result.stdout.trim();
+}
+
+function createRepo(prefix: string): string {
+	const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+	git(repoDir, ["init"]);
+	git(repoDir, ["config", "user.email", "tests@example.com"]);
+	git(repoDir, ["config", "user.name", "Async Tests"]);
+	fs.writeFileSync(path.join(repoDir, "input.md"), "input\n", "utf-8");
+	git(repoDir, ["add", "-A"]);
+	git(repoDir, ["commit", "-m", "initial commit"]);
+	return repoDir;
+}
 
 function writePackageSkill(packageRoot: string, skillName: string): void {
 	const skillDir = path.join(packageRoot, "skills", skillName);
@@ -126,6 +156,103 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			assert.equal(status.mode, "single");
 		} finally {
 			removeTempDir(dir);
+		}
+	});
+
+	it("top-level async parallel conversion preserves output, reads, and progress", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+		mockPi.onCall({ output: "Async top-level report" });
+		const executor = createSubagentExecutor!({
+			pi: { events: createEventBus(), getSessionName: () => undefined },
+			state: { baseCwd: tempDir, currentSessionId: null, asyncJobs: new Map(), foregroundControls: new Map(), lastForegroundControlId: null },
+			config: {},
+			asyncByDefault: false,
+			tempArtifactsDir: tempDir,
+			getSubagentSessionRoot: () => tempDir,
+			expandTilde: (p: string) => p,
+			discoverAgents: () => ({ agents: [makeAgent("worker")] }),
+		});
+
+		const result = await executor.execute(
+			"async-parallel-fields",
+			{
+				tasks: [{ agent: "worker", task: "Do async work", output: "async-top-output.md", reads: ["input.md"], progress: true }],
+				async: true,
+				clarify: false,
+			},
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		const asyncId = result.details?.asyncId;
+		assert.ok(asyncId, "expected asyncId");
+		const resultPath = path.join(RESULTS_DIR, `${asyncId}.json`);
+		const deadline = Date.now() + 10_000;
+		while (!fs.existsSync(resultPath)) {
+			if (Date.now() > deadline) assert.fail(`Timed out waiting for async result file: ${resultPath}`);
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+
+		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+		assert.equal(payload.mode, "parallel");
+		const outputPath = path.join(tempDir, "async-top-output.md");
+		assert.equal(fs.readFileSync(outputPath, "utf-8"), "Async top-level report");
+		const callFile = fs.readdirSync(mockPi.dir).find((name) => name.startsWith("call-"));
+		assert.ok(callFile, "expected a recorded mock pi call");
+		const args = JSON.parse(fs.readFileSync(path.join(mockPi.dir, callFile), "utf-8")).args as string[];
+		const taskArg = args.at(-1) ?? "";
+		assert.ok(taskArg.includes(`[Read from: ${path.join(tempDir, "input.md")}]`));
+		assert.ok(taskArg.includes(`Update progress at: ${path.join(tempDir, "progress.md")}`));
+		assert.ok(taskArg.includes(`Write your findings to: ${outputPath}`));
+		assert.equal(fs.existsSync(path.join(tempDir, "progress.md")), true);
+	});
+
+	it("top-level async worktree parallel resolves reads and output against the worktree cwd", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+		const repoDir = createRepo("pi-subagent-async-worktree-");
+		try {
+			mockPi.onCall({ output: "Worktree report" });
+			const executor = createSubagentExecutor!({
+				pi: { events: createEventBus(), getSessionName: () => undefined },
+				state: { baseCwd: repoDir, currentSessionId: null, asyncJobs: new Map(), foregroundControls: new Map(), lastForegroundControlId: null },
+				config: {},
+				asyncByDefault: false,
+				tempArtifactsDir: repoDir,
+				getSubagentSessionRoot: () => repoDir,
+				expandTilde: (p: string) => p,
+				discoverAgents: () => ({ agents: [makeAgent("worker")] }),
+			});
+
+			const result = await executor.execute(
+				"async-parallel-worktree-fields",
+				{
+					tasks: [{ agent: "worker", task: "Do worktree work", output: "report.md", reads: ["input.md"] }],
+					async: true,
+					clarify: false,
+					worktree: true,
+				},
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(repoDir),
+			);
+
+			const asyncId = result.details?.asyncId;
+			assert.ok(asyncId, "expected asyncId");
+			const resultPath = path.join(RESULTS_DIR, `${asyncId}.json`);
+			const deadline = Date.now() + 10_000;
+			while (!fs.existsSync(resultPath)) {
+				if (Date.now() > deadline) assert.fail(`Timed out waiting for async result file: ${resultPath}`);
+				await new Promise((resolve) => setTimeout(resolve, 100));
+			}
+
+			const worktreeCwd = path.join(os.tmpdir(), `pi-worktree-${asyncId}-s0-0`);
+			const callFile = fs.readdirSync(mockPi.dir).find((name) => name.startsWith("call-"));
+			assert.ok(callFile, "expected a recorded mock pi call");
+			const args = JSON.parse(fs.readFileSync(path.join(mockPi.dir, callFile), "utf-8")).args as string[];
+			const taskArg = args.at(-1) ?? "";
+			assert.ok(taskArg.includes(`[Read from: ${path.join(worktreeCwd, "input.md")}]`));
+			assert.ok(taskArg.includes(`Write your findings to: ${path.join(worktreeCwd, "report.md")}`));
+		} finally {
+			removeTempDir(repoDir);
 		}
 	});
 
@@ -219,6 +346,9 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(payload.results[0].model, "anthropic/claude-sonnet-4");
 		assert.deepEqual(payload.results[0].attemptedModels, ["openai/gpt-5-mini", "anthropic/claude-sonnet-4"]);
 		assert.equal(payload.results[0].modelAttempts.length, 2);
+		const statusPayload = JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8"));
+		assert.ok(statusPayload.totalTokens.total > 0);
+		assert.ok(statusPayload.steps[0].tokens.total > 0);
 		assert.match(fs.readFileSync(path.join(asyncDir, "output-0.log"), "utf-8"), /Recovered asynchronously/);
 		assert.equal(mockPi.callCount(), 2);
 	});
@@ -358,15 +488,136 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		}
 	});
 
+	it("background chains resolve relative step cwd values against the shared cwd", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({ output: "Done asynchronously" });
+		const chainCwd = createTempDir("pi-subagent-async-chain-cwd-");
+		const id = `async-chain-skill-cwd-${Date.now().toString(36)}`;
+		const asyncDir = path.join(ASYNC_DIR, id);
+		const resultPath = path.join(RESULTS_DIR, `${id}.json`);
+		const statusPath = path.join(asyncDir, "status.json");
+
+		try {
+			writePackageSkill(path.join(chainCwd, "packages", "app"), "async-chain-step-skill");
+			executeAsyncChain(id, {
+				chain: [{ agent: "worker", task: "Do work", cwd: "packages/app", skill: ["async-chain-step-skill"] }],
+				agents: [makeAgent("worker")],
+				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+				cwd: chainCwd,
+				artifactConfig: {
+					enabled: false,
+					includeInput: false,
+					includeOutput: false,
+					includeJsonl: false,
+					includeMetadata: false,
+					cleanupDays: 7,
+				},
+				shareEnabled: false,
+				sessionRoot: path.join(tempDir, "sessions"),
+				maxSubagentDepth: 2,
+			});
+
+			const deadline = Date.now() + 10_000;
+			while (!fs.existsSync(resultPath)) {
+				if (Date.now() > deadline) {
+					assert.fail(`Timed out waiting for async result file: ${resultPath}`);
+				}
+				await new Promise((resolve) => setTimeout(resolve, 100));
+			}
+
+			const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+			const status = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as AsyncStatusPayload;
+			assert.equal(payload.success, true);
+			assert.deepEqual(status.steps?.[0]?.skills, ["async-chain-step-skill"]);
+		} finally {
+			removeTempDir(chainCwd);
+		}
+	});
+
 	it("returns a tool error when the detached runner config cannot be written", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, () => {
 		const id = `async-write-fail-${Date.now().toString(36)}`;
 		assert.ok(TEMP_ROOT_DIR, "TEMP_ROOT_DIR should be available for async tests");
 		fs.mkdirSync(TEMP_ROOT_DIR, { recursive: true });
-		fs.mkdirSync(ASYNC_DIR, { recursive: true });
-		const originalMode = fs.statSync(TEMP_ROOT_DIR).mode & 0o777;
-		fs.chmodSync(TEMP_ROOT_DIR, 0o555);
+		fs.mkdirSync(path.join(TEMP_ROOT_DIR, `async-cfg-${id}.json`), { recursive: true });
 
+		const result = executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Do work",
+			agentConfig: makeAgent("worker"),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: {
+				enabled: false,
+				includeInput: false,
+				includeOutput: false,
+				includeJsonl: false,
+				includeMetadata: false,
+				cleanupDays: 7,
+			},
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+		});
+
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]?.text ?? "", /Failed to start async run/);
+		assert.match(result.content[0]?.text ?? "", /async-cfg-/);
+	});
+
+	it("returns a tool error when an async run uses a missing cwd", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, () => {
+		const id = `async-missing-cwd-${Date.now().toString(36)}`;
+		const missingCwd = path.join(tempDir, "missing-cwd");
+
+		const singleResult = executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Do work",
+			agentConfig: makeAgent("worker"),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			cwd: missingCwd,
+			artifactConfig: {
+				enabled: false,
+				includeInput: false,
+				includeOutput: false,
+				includeJsonl: false,
+				includeMetadata: false,
+				cleanupDays: 7,
+			},
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+		});
+
+		assert.equal(singleResult.isError, true);
+		assert.match(singleResult.content[0]?.text ?? "", /Failed to start async run/);
+		assert.match(singleResult.content[0]?.text ?? "", /cwd does not exist/);
+
+		const chainId = `async-missing-cwd-chain-${Date.now().toString(36)}`;
+		const chainResult = executeAsyncChain(chainId, {
+			chain: [{ agent: "worker", task: "Do work" }],
+			agents: [makeAgent("worker")],
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			cwd: missingCwd,
+			artifactConfig: {
+				enabled: false,
+				includeInput: false,
+				includeOutput: false,
+				includeJsonl: false,
+				includeMetadata: false,
+				cleanupDays: 7,
+			},
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+		});
+
+		assert.equal(chainResult.isError, true);
+		assert.match(chainResult.content[0]?.text ?? "", /Failed to start async chain/);
+		assert.match(chainResult.content[0]?.text ?? "", /cwd does not exist/);
+	});
+
+	it("returns a tool error when the async runner process cannot spawn", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, () => {
+		const originalExecPath = process.execPath;
+		process.execPath = path.join(tempDir, "missing-node");
 		try {
+			const id = `async-spawn-fail-${Date.now().toString(36)}`;
 			const result = executeAsyncSingle(id, {
 				agent: "worker",
 				task: "Do work",
@@ -387,9 +638,9 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 
 			assert.equal(result.isError, true);
 			assert.match(result.content[0]?.text ?? "", /Failed to start async run/);
-			assert.match(result.content[0]?.text ?? "", /async-cfg-/);
+			assert.match(result.content[0]?.text ?? "", /async runner did not produce a pid/);
 		} finally {
-			fs.chmodSync(TEMP_ROOT_DIR, originalMode);
+			process.execPath = originalExecPath;
 		}
 	});
 
@@ -397,34 +648,28 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		const id = `async-chain-write-fail-${Date.now().toString(36)}`;
 		assert.ok(TEMP_ROOT_DIR, "TEMP_ROOT_DIR should be available for async tests");
 		fs.mkdirSync(TEMP_ROOT_DIR, { recursive: true });
-		fs.mkdirSync(ASYNC_DIR, { recursive: true });
-		const originalMode = fs.statSync(TEMP_ROOT_DIR).mode & 0o777;
-		fs.chmodSync(TEMP_ROOT_DIR, 0o555);
+		fs.mkdirSync(path.join(TEMP_ROOT_DIR, `async-cfg-${id}.json`), { recursive: true });
 
-		try {
-			const result = executeAsyncChain(id, {
-				chain: [{ agent: "worker", task: "Do work" }],
-				agents: [makeAgent("worker")],
-				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
-				artifactConfig: {
-					enabled: false,
-					includeInput: false,
-					includeOutput: false,
-					includeJsonl: false,
-					includeMetadata: false,
-					cleanupDays: 7,
-				},
-				shareEnabled: false,
-				sessionRoot: path.join(tempDir, "sessions"),
-				maxSubagentDepth: 2,
-			});
+		const result = executeAsyncChain(id, {
+			chain: [{ agent: "worker", task: "Do work" }],
+			agents: [makeAgent("worker")],
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: {
+				enabled: false,
+				includeInput: false,
+				includeOutput: false,
+				includeJsonl: false,
+				includeMetadata: false,
+				cleanupDays: 7,
+			},
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+		});
 
-			assert.equal(result.isError, true);
-			assert.match(result.content[0]?.text ?? "", /Failed to start async chain/);
-			assert.match(result.content[0]?.text ?? "", /async-cfg-/);
-		} finally {
-			fs.chmodSync(TEMP_ROOT_DIR, originalMode);
-		}
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]?.text ?? "", /Failed to start async chain/);
+		assert.match(result.content[0]?.text ?? "", /async-cfg-/);
 	});
 
 	it("background runs stream child events and live output while active", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
